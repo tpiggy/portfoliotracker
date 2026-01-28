@@ -7,6 +7,10 @@ Reads an investment tracking ODS file and creates visualizations including:
 - Largest Account
 - Top Holding
 - Asset Mix
+- Risk Analysis & Concentration Warnings
+- Consolidated Holdings View
+- Daily Performance Tracking
+- Rebalancing Suggestions
 """
 
 import sys
@@ -14,6 +18,29 @@ import pyexcel
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from datetime import datetime
+
+
+# Target allocation for rebalancing (customize as needed)
+TARGET_ALLOCATION = {
+    'Equities': 0.30,
+    'Mining - Copper': 0.10,
+    'Mining - Coal': 0.10,
+    'Mining - Gold': 0.05,
+    'Mining - Services': 0.05,
+    'Energy - Oil & Gas': 0.05,
+    'Energy - Pipelines': 0.05,
+    'Real Estate': 0.05,
+    'Cryptocurrency': 0.10,
+    'Cash': 0.10,
+    'Other': 0.05,
+}
+
+# Risk thresholds
+MAX_SINGLE_HOLDING_PCT = 0.15  # 15% max for any single holding
+MAX_SECTOR_PCT = 0.30  # 30% max for any single sector
+MAX_CRYPTO_PCT = 0.15  # 15% max for crypto
+MIN_CASH_PCT = 0.05  # 5% minimum cash
 
 
 # Asset class mappings based on ticker/name patterns
@@ -223,7 +250,191 @@ def calculate_portfolio_metrics(df: pd.DataFrame) -> dict:
     return metrics
 
 
-def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."):
+def analyze_risk(df: pd.DataFrame, metrics: dict) -> dict:
+    """Analyze portfolio risk and generate warnings."""
+    risk = {
+        'warnings': [],
+        'concentration_score': 0,
+        'diversification_rating': '',
+        'hhi': 0,  # Herfindahl-Hirschman Index
+    }
+
+    total_value = metrics['total_value']
+
+    # Calculate HHI (sum of squared market shares) - lower is more diversified
+    holdings_pct = (df['Value'] / total_value * 100) ** 2
+    risk['hhi'] = holdings_pct.sum()
+
+    # Diversification rating based on HHI
+    if risk['hhi'] < 1000:
+        risk['diversification_rating'] = 'Excellent'
+        risk['concentration_score'] = 10
+    elif risk['hhi'] < 1500:
+        risk['diversification_rating'] = 'Good'
+        risk['concentration_score'] = 8
+    elif risk['hhi'] < 2500:
+        risk['diversification_rating'] = 'Moderate'
+        risk['concentration_score'] = 6
+    elif risk['hhi'] < 4000:
+        risk['diversification_rating'] = 'Concentrated'
+        risk['concentration_score'] = 4
+    else:
+        risk['diversification_rating'] = 'Highly Concentrated'
+        risk['concentration_score'] = 2
+
+    # Check single holding concentration
+    for _, row in df.iterrows():
+        pct = row['Value'] / total_value
+        if pct > MAX_SINGLE_HOLDING_PCT:
+            risk['warnings'].append({
+                'type': 'HIGH_CONCENTRATION',
+                'severity': 'high' if pct > 0.25 else 'medium',
+                'message': f"{row['Ticker']} is {pct*100:.1f}% of portfolio (>{MAX_SINGLE_HOLDING_PCT*100:.0f}% threshold)"
+            })
+
+    # Check sector concentration
+    for sector, value in metrics['asset_mix'].items():
+        pct = value / total_value
+        if pct > MAX_SECTOR_PCT:
+            risk['warnings'].append({
+                'type': 'SECTOR_CONCENTRATION',
+                'severity': 'high' if pct > 0.40 else 'medium',
+                'message': f"{sector} is {pct*100:.1f}% of portfolio (>{MAX_SECTOR_PCT*100:.0f}% threshold)"
+            })
+
+    # Check crypto exposure
+    crypto_value = metrics['asset_mix'].get('Cryptocurrency', 0)
+    crypto_pct = crypto_value / total_value
+    if crypto_pct > MAX_CRYPTO_PCT:
+        risk['warnings'].append({
+            'type': 'CRYPTO_EXPOSURE',
+            'severity': 'high' if crypto_pct > 0.30 else 'medium',
+            'message': f"Cryptocurrency is {crypto_pct*100:.1f}% of portfolio (>{MAX_CRYPTO_PCT*100:.0f}% recommended max)"
+        })
+
+    # Check cash levels
+    cash_value = metrics['asset_mix'].get('Cash', 0)
+    cash_pct = cash_value / total_value
+    if cash_pct < MIN_CASH_PCT:
+        risk['warnings'].append({
+            'type': 'LOW_CASH',
+            'severity': 'low',
+            'message': f"Cash is only {cash_pct*100:.1f}% of portfolio (<{MIN_CASH_PCT*100:.0f}% recommended min)"
+        })
+
+    return risk
+
+
+def get_consolidated_holdings(df: pd.DataFrame) -> pd.DataFrame:
+    """Consolidate same ticker across all accounts."""
+    consolidated = df.groupby('Ticker').agg({
+        'Name': 'first',
+        'Value': 'sum',
+        'Shares': 'sum',
+        'Price': 'first',
+        'Asset Class': 'first',
+        'Account': lambda x: ', '.join(sorted(set(x)))
+    }).reset_index()
+
+    consolidated = consolidated.sort_values('Value', ascending=False)
+    consolidated['Pct'] = consolidated['Value'] / consolidated['Value'].sum() * 100
+
+    return consolidated
+
+
+def calculate_rebalancing(metrics: dict) -> pd.DataFrame:
+    """Calculate rebalancing suggestions based on target allocation."""
+    total_value = metrics['total_value']
+    current_allocation = metrics['asset_mix']
+
+    rebalance_data = []
+    for sector, target_pct in TARGET_ALLOCATION.items():
+        current_value = current_allocation.get(sector, 0)
+        current_pct = current_value / total_value
+
+        target_value = total_value * target_pct
+        difference = target_value - current_value
+        diff_pct = target_pct - current_pct
+
+        if abs(diff_pct) > 0.01:  # Only show if difference > 1%
+            rebalance_data.append({
+                'Sector': sector,
+                'Current %': current_pct * 100,
+                'Target %': target_pct * 100,
+                'Diff %': diff_pct * 100,
+                'Action': 'BUY' if difference > 0 else 'SELL',
+                'Amount': abs(difference)
+            })
+
+    # Add sectors not in target but in portfolio
+    for sector, value in current_allocation.items():
+        if sector not in TARGET_ALLOCATION:
+            current_pct = value / total_value
+            if current_pct > 0.01:
+                rebalance_data.append({
+                    'Sector': sector,
+                    'Current %': current_pct * 100,
+                    'Target %': 0,
+                    'Diff %': -current_pct * 100,
+                    'Action': 'REVIEW',
+                    'Amount': value
+                })
+
+    return pd.DataFrame(rebalance_data).sort_values('Diff %', key=abs, ascending=False)
+
+
+def calculate_daily_performance(df: pd.DataFrame) -> dict:
+    """Calculate daily performance metrics from Change column."""
+    perf = {
+        'daily_change_total': 0,
+        'daily_change_pct': 0,
+        'gainers': [],
+        'losers': [],
+    }
+
+    if 'Change' not in df.columns:
+        return perf
+
+    # Filter rows with valid change data
+    df_with_change = df[df['Change'] != 0].copy()
+
+    if df_with_change.empty:
+        return perf
+
+    # Calculate daily dollar change for each holding
+    # Change is typically % change, so: dollar_change = value * change / (100 + change)
+    # Or approximate: dollar_change = value * (change/100) for small changes
+    df_with_change['Dollar_Change'] = df_with_change.apply(
+        lambda row: row['Value'] * (row['Change'] / 100) / (1 + row['Change'] / 100)
+        if row['Change'] != 0 else 0, axis=1
+    )
+
+    perf['daily_change_total'] = df_with_change['Dollar_Change'].sum()
+
+    # Previous day's value
+    prev_value = df['Value'].sum() - perf['daily_change_total']
+    if prev_value > 0:
+        perf['daily_change_pct'] = (perf['daily_change_total'] / prev_value) * 100
+
+    # Top gainers and losers
+    sorted_by_change = df_with_change.sort_values('Change', ascending=False)
+
+    gainers = sorted_by_change[sorted_by_change['Change'] > 0].head(5)
+    perf['gainers'] = [
+        {'ticker': row['Ticker'], 'change': row['Change'], 'dollar': row['Dollar_Change']}
+        for _, row in gainers.iterrows()
+    ]
+
+    losers = sorted_by_change[sorted_by_change['Change'] < 0].tail(5)
+    perf['losers'] = [
+        {'ticker': row['Ticker'], 'change': row['Change'], 'dollar': row['Dollar_Change']}
+        for _, row in losers.iterrows()
+    ]
+
+    return perf
+
+
+def create_visualizations(df: pd.DataFrame, metrics: dict, risk: dict, perf: dict, output_dir: str = "."):
     """Create and save portfolio visualizations."""
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
@@ -232,8 +443,8 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
     plt.style.use('seaborn-v0_8-whitegrid')
     colors = plt.cm.Set3.colors
 
-    # Create a figure with 4 subplots (2x2)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # Create a figure with 6 subplots (2x3)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     fig.suptitle('Investment Portfolio Dashboard', fontsize=16, fontweight='bold', y=1.02)
 
     # 1. Total Portfolio Value - Summary Card
@@ -295,12 +506,41 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
 
     ax2.invert_yaxis()
 
-    # 3. Asset Mix - Pie Chart
-    ax3 = axes[1, 0]
+    # 3. Risk Analysis Panel
+    ax3 = axes[0, 2]
+    ax3.set_xlim(0, 10)
+    ax3.set_ylim(0, 10)
+    ax3.axis('off')
+
+    ax3.text(5, 9.5, 'Risk Analysis', fontsize=12, fontweight='bold', ha='center', va='center')
+
+    # Diversification rating
+    rating_color = {'Excellent': '#2E7D32', 'Good': '#4CAF50', 'Moderate': '#FFC107',
+                    'Concentrated': '#FF9800', 'Highly Concentrated': '#F44336'}
+    color = rating_color.get(risk['diversification_rating'], '#666666')
+    ax3.text(5, 8, f"Diversification: {risk['diversification_rating']}", fontsize=11,
+             ha='center', va='center', color=color, fontweight='bold')
+    ax3.text(5, 7, f"HHI Score: {risk['hhi']:.0f}", fontsize=9, ha='center', va='center', color='#666666')
+
+    # Warnings
+    y_pos = 5.5
+    if risk['warnings']:
+        ax3.text(5, 6, 'Warnings:', fontsize=10, ha='center', va='center', fontweight='bold', color='#D32F2F')
+        for warning in risk['warnings'][:4]:  # Show max 4 warnings
+            severity_color = '#D32F2F' if warning['severity'] == 'high' else '#FF9800' if warning['severity'] == 'medium' else '#666666'
+            # Truncate long messages
+            msg = warning['message'][:40] + '...' if len(warning['message']) > 40 else warning['message']
+            ax3.text(5, y_pos, f"• {msg}", fontsize=8, ha='center', va='center', color=severity_color)
+            y_pos -= 0.9
+    else:
+        ax3.text(5, 5, 'No warnings', fontsize=10, ha='center', va='center', color='#2E7D32')
+
+    # 4. Asset Mix - Pie Chart
+    ax4 = axes[1, 0]
     asset_data = metrics['asset_mix']
 
     # Create pie chart with percentages
-    wedges, texts, autotexts = ax3.pie(
+    wedges, texts, autotexts = ax4.pie(
         asset_data.values,
         labels=asset_data.index,
         autopct=lambda pct: f'{pct:.1f}%' if pct > 3 else '',
@@ -308,31 +548,31 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
         explode=[0.02] * len(asset_data),
         startangle=90
     )
-    ax3.set_title('Asset Mix', fontsize=12, fontweight='bold', pad=10)
+    ax4.set_title('Asset Mix', fontsize=12, fontweight='bold', pad=10)
 
     # Style the percentage labels
     for autotext in autotexts:
         autotext.set_fontsize(9)
         autotext.set_fontweight('bold')
 
-    # 4. Top 10 Holdings - Horizontal Bar Chart
-    ax4 = axes[1, 1]
+    # 5. Top 10 Holdings - Horizontal Bar Chart
+    ax5 = axes[1, 1]
     top_holdings = metrics['top_holdings']
     y_pos = range(len(top_holdings))
 
     # Create labels with ticker and name
     labels = [f"{row['Ticker']}" for _, row in top_holdings.iterrows()]
 
-    bars = ax4.barh(y_pos, top_holdings['Value'].values,
+    bars = ax5.barh(y_pos, top_holdings['Value'].values,
                     color=[colors[i % len(colors)] for i in range(len(top_holdings))])
-    ax4.set_yticks(y_pos)
-    ax4.set_yticklabels(labels)
-    ax4.set_xlabel('Value ($)')
-    ax4.set_title('Top 10 Holdings', fontsize=12, fontweight='bold', pad=10)
+    ax5.set_yticks(y_pos)
+    ax5.set_yticklabels(labels)
+    ax5.set_xlabel('Value ($)')
+    ax5.set_title('Top 10 Holdings', fontsize=12, fontweight='bold', pad=10)
 
     # Add value labels
     for bar, val in zip(bars, top_holdings['Value'].values):
-        ax4.text(val + metrics['total_value'] * 0.005, bar.get_y() + bar.get_height()/2,
+        ax5.text(val + metrics['total_value'] * 0.005, bar.get_y() + bar.get_height()/2,
                  f'${val:,.0f}', va='center', fontsize=9)
 
     # Highlight top holding
@@ -340,7 +580,41 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
     bars[0].set_edgecolor('#0D47A1')
     bars[0].set_linewidth(2)
 
-    ax4.invert_yaxis()
+    ax5.invert_yaxis()
+
+    # 6. Daily Performance Panel
+    ax6 = axes[1, 2]
+    ax6.set_xlim(0, 10)
+    ax6.set_ylim(0, 10)
+    ax6.axis('off')
+
+    ax6.text(5, 9.5, 'Daily Performance', fontsize=12, fontweight='bold', ha='center', va='center')
+
+    # Daily change
+    change_color = '#2E7D32' if perf['daily_change_total'] >= 0 else '#D32F2F'
+    change_sign = '+' if perf['daily_change_total'] >= 0 else ''
+    ax6.text(5, 8, f"{change_sign}${perf['daily_change_total']:,.2f}", fontsize=18, fontweight='bold',
+             ha='center', va='center', color=change_color)
+    ax6.text(5, 7, f"({change_sign}{perf['daily_change_pct']:.2f}%)", fontsize=11,
+             ha='center', va='center', color=change_color)
+
+    # Top gainers
+    y_pos = 5.5
+    if perf['gainers']:
+        ax6.text(2.5, 6, 'Top Gainers', fontsize=9, ha='center', va='center', fontweight='bold', color='#2E7D32')
+        for g in perf['gainers'][:3]:
+            ax6.text(2.5, y_pos, f"{g['ticker']}: +{g['change']:.1f}%", fontsize=8,
+                     ha='center', va='center', color='#2E7D32')
+            y_pos -= 0.7
+
+    # Top losers
+    y_pos = 5.5
+    if perf['losers']:
+        ax6.text(7.5, 6, 'Top Losers', fontsize=9, ha='center', va='center', fontweight='bold', color='#D32F2F')
+        for l in perf['losers'][:3]:
+            ax6.text(7.5, y_pos, f"{l['ticker']}: {l['change']:.1f}%", fontsize=8,
+                     ha='center', va='center', color='#D32F2F')
+            y_pos -= 0.7
 
     plt.tight_layout()
 
@@ -354,13 +628,18 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
     return str(dashboard_path)
 
 
-def print_summary(metrics: dict):
-    """Print a text summary of the portfolio."""
-    print("\n" + "=" * 60)
+def print_summary(metrics: dict, risk: dict, perf: dict, consolidated: pd.DataFrame, rebalance: pd.DataFrame):
+    """Print a comprehensive text summary of the portfolio."""
+    print("\n" + "=" * 70)
     print("INVESTMENT PORTFOLIO SUMMARY")
-    print("=" * 60)
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 70)
 
     print(f"\n{'Total Portfolio Value:':<25} ${metrics['total_value']:>15,.2f}")
+
+    # Daily performance
+    change_sign = '+' if perf['daily_change_total'] >= 0 else ''
+    print(f"{'Daily Change:':<25} {change_sign}${perf['daily_change_total']:>14,.2f} ({change_sign}{perf['daily_change_pct']:.2f}%)")
 
     print(f"\n{'Largest Account:':<25} {metrics['largest_account']}")
     print(f"{'   Value:':<25} ${metrics['largest_account_value']:>15,.2f}")
@@ -370,19 +649,59 @@ def print_summary(metrics: dict):
     print(f"{'   Value:':<25} ${top['value']:>15,.2f}")
     print(f"{'   Account:':<25} {top['account']}")
 
-    print("\nAsset Mix:")
-    print("-" * 40)
+    # Risk Analysis
+    print("\n" + "-" * 70)
+    print("RISK ANALYSIS")
+    print("-" * 70)
+    print(f"{'Diversification Rating:':<25} {risk['diversification_rating']}")
+    print(f"{'HHI Score:':<25} {risk['hhi']:.0f} (lower is more diversified)")
+
+    if risk['warnings']:
+        print(f"\n{'Warnings:':<25} {len(risk['warnings'])} issues found")
+        for w in risk['warnings']:
+            severity_icon = '!!' if w['severity'] == 'high' else '!' if w['severity'] == 'medium' else '~'
+            print(f"  [{severity_icon}] {w['message']}")
+    else:
+        print(f"\n{'Warnings:':<25} None - portfolio looks healthy!")
+
+    # Consolidated Holdings (top 10)
+    print("\n" + "-" * 70)
+    print("CONSOLIDATED HOLDINGS (Same ticker across accounts)")
+    print("-" * 70)
+    print(f"{'Ticker':<10} {'Name':<30} {'Value':>15} {'Pct':>8} {'Accounts'}")
+    print("-" * 70)
+    for _, row in consolidated.head(10).iterrows():
+        name = str(row['Name'])[:28] + '..' if len(str(row['Name'])) > 30 else str(row['Name'])
+        accounts = str(row['Account'])[:20] + '..' if len(str(row['Account'])) > 22 else str(row['Account'])
+        print(f"{row['Ticker']:<10} {name:<30} ${row['Value']:>14,.2f} {row['Pct']:>6.1f}%  {accounts}")
+
+    # Asset Mix
+    print("\n" + "-" * 70)
+    print("ASSET MIX")
+    print("-" * 70)
     for asset_class, value in metrics['asset_mix'].items():
         pct = (value / metrics['total_value']) * 100
         print(f"  {asset_class:<25} ${value:>12,.2f} ({pct:>5.1f}%)")
 
-    print("\nAccount Breakdown:")
-    print("-" * 40)
+    # Account Breakdown
+    print("\n" + "-" * 70)
+    print("ACCOUNT BREAKDOWN")
+    print("-" * 70)
     for account, value in metrics['account_values'].items():
         pct = (value / metrics['total_value']) * 100
         print(f"  {account:<25} ${value:>12,.2f} ({pct:>5.1f}%)")
 
-    print("\n" + "=" * 60)
+    # Rebalancing Suggestions
+    if not rebalance.empty:
+        print("\n" + "-" * 70)
+        print("REBALANCING SUGGESTIONS")
+        print("-" * 70)
+        print(f"{'Sector':<25} {'Current':>8} {'Target':>8} {'Action':>8} {'Amount':>12}")
+        print("-" * 70)
+        for _, row in rebalance.head(8).iterrows():
+            print(f"{row['Sector']:<25} {row['Current %']:>7.1f}% {row['Target %']:>7.1f}% {row['Action']:>8} ${row['Amount']:>11,.0f}")
+
+    print("\n" + "=" * 70)
 
 
 def main():
@@ -406,15 +725,27 @@ def main():
     df = load_portfolio_data(ods_file)
     print(f"Loaded {len(df)} holdings")
 
-    # Calculate metrics
+    # Calculate core metrics
     metrics = calculate_portfolio_metrics(df)
 
-    # Print summary
-    print_summary(metrics)
+    # Run risk analysis
+    risk = analyze_risk(df, metrics)
+
+    # Calculate daily performance
+    perf = calculate_daily_performance(df)
+
+    # Get consolidated holdings view
+    consolidated = get_consolidated_holdings(df)
+
+    # Calculate rebalancing suggestions
+    rebalance = calculate_rebalancing(metrics)
+
+    # Print comprehensive summary
+    print_summary(metrics, risk, perf, consolidated, rebalance)
 
     # Create visualizations
     print("\nGenerating visualizations...")
-    output_file = create_visualizations(df, metrics)
+    output_file = create_visualizations(df, metrics, risk, perf)
 
     print(f"\nDashboard saved to: {output_file}")
     print("Open this file to view your portfolio visualizations!")
