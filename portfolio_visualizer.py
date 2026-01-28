@@ -16,6 +16,49 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
+# Asset class mappings based on ticker/name patterns
+ASSET_CLASS_RULES = {
+    'CASH$': 'Cash',
+    'MMA': 'Mining - Copper',
+    'AMR': 'Mining - Coal',
+    'CVE': 'Mining - Coal',
+    'WM': 'Mining - Gold',
+    'FAR': 'Mining - Services',
+    'TOU': 'Energy - Oil & Gas',
+    'LAND': 'Real Estate',
+    'LULU': 'Consumer Discretionary',
+    'GURU': 'Consumer Staples',
+    'PZZA': 'Consumer Discretionary',
+    'RKLB': 'Aerospace & Defense',
+    'CRSP': 'Biotech',
+    'BEAM': 'Biotech',
+}
+
+
+def infer_asset_class(ticker: str, name: str) -> str:
+    """Infer asset class from ticker or company name."""
+    ticker = str(ticker).upper()
+    name = str(name).lower()
+
+    # Check direct ticker mapping
+    if ticker in ASSET_CLASS_RULES:
+        return ASSET_CLASS_RULES[ticker]
+
+    # Infer from name patterns
+    if 'mining' in name or 'coal' in name or 'metallurgical' in name:
+        return 'Mining'
+    if 'oil' in name or 'gas' in name or 'energy' in name:
+        return 'Energy'
+    if 'cash' in name:
+        return 'Cash'
+    if 'therapeutics' in name or 'biotech' in name or 'crispr' in name:
+        return 'Biotech'
+    if 'land' in name or 'real estate' in name or 'reit' in name:
+        return 'Real Estate'
+
+    return 'Equities'
+
+
 def load_portfolio_data(ods_file: str) -> pd.DataFrame:
     """Load investment data from an ODS file into a pandas DataFrame."""
     data = pyexcel.get_array(file_name=ods_file)
@@ -23,19 +66,51 @@ def load_portfolio_data(ods_file: str) -> pd.DataFrame:
     if not data or len(data) < 2:
         raise ValueError("ODS file is empty or has no data rows")
 
-    # First row is header
-    header = data[0]
-    rows = data[1:]
+    # Detect format: check if first row looks like headers or data
+    first_row = data[0]
 
-    df = pd.DataFrame(rows, columns=header)
+    # Check for Portfolio.ods format (data first, headers later)
+    # In this format, row 15 contains headers like 'Name', 'Ticker', etc.
+    is_portfolio_format = False
+    for i, row in enumerate(data):
+        if len(row) > 0 and row[0] == 'Name' and len(row) > 1 and row[1] == 'Ticker':
+            is_portfolio_format = True
+            header_row = i
+            break
+
+    if is_portfolio_format:
+        # Portfolio.ods format: data rows come before header row
+        header = ['Name', 'Ticker', 'Price', 'Shares', 'Value', 'Percentage', 'Change', 'Extra1', 'Extra2']
+        rows = []
+        for row in data[:header_row]:
+            # Skip empty rows or rows without valid data
+            if len(row) >= 5 and row[0] and row[4]:
+                try:
+                    value = float(row[4]) if row[4] else 0
+                    if value > 0:
+                        rows.append(row[:9] if len(row) >= 9 else row + [''] * (9 - len(row)))
+                except (ValueError, TypeError):
+                    continue
+
+        df = pd.DataFrame(rows, columns=header)
+    else:
+        # Standard format: first row is header
+        header = data[0]
+        rows = data[1:]
+        df = pd.DataFrame(rows, columns=header)
 
     # Ensure numeric columns are proper types
-    if 'Value' in df.columns:
-        df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
-    if 'Shares' in df.columns:
-        df['Shares'] = pd.to_numeric(df['Shares'], errors='coerce')
-    if 'Price' in df.columns:
-        df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+    for col in ['Value', 'Shares', 'Price', 'Percentage', 'Change']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Add Asset Class column if not present
+    if 'Asset Class' not in df.columns:
+        df['Asset Class'] = df.apply(lambda row: infer_asset_class(row.get('Ticker', ''), row.get('Name', '')), axis=1)
+
+    # Add Account column if not present (default to 'Main Portfolio')
+    if 'Account' not in df.columns:
+        df['Account'] = 'Main Portfolio'
 
     return df
 
@@ -103,7 +178,10 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
     num_holdings = len(df)
     num_asset_classes = len(metrics['asset_mix'])
 
-    summary_text = f"{num_holdings} Holdings  |  {num_accounts} Accounts  |  {num_asset_classes} Asset Classes"
+    if num_accounts <= 1:
+        summary_text = f"{num_holdings} Holdings  |  {num_asset_classes} Sectors"
+    else:
+        summary_text = f"{num_holdings} Holdings  |  {num_accounts} Accounts  |  {num_asset_classes} Asset Classes"
     ax1.text(5, 4, summary_text, fontsize=11, ha='center', va='center', color='#666666')
 
     # Top holding info
@@ -113,26 +191,32 @@ def create_visualizations(df: pd.DataFrame, metrics: dict, output_dir: str = "."
     ax1.text(5, 1, f"${top['value']:,.2f} in {top['account']}",
              fontsize=10, ha='center', va='center', color='#666666')
 
-    # 2. Account Breakdown - Horizontal Bar Chart
+    # 2. Sector/Holdings Breakdown - Horizontal Bar Chart
     ax2 = axes[0, 1]
-    account_data = metrics['account_values']
-    y_pos = range(len(account_data))
-    bars = ax2.barh(y_pos, account_data.values, color=[colors[i % len(colors)] for i in range(len(account_data))])
+    # If only one account, show asset class breakdown instead
+    if len(metrics['account_values']) <= 1:
+        breakdown_data = metrics['asset_mix']
+        title = 'Value by Sector'
+    else:
+        breakdown_data = metrics['account_values']
+        title = 'Value by Account'
+
+    y_pos = range(len(breakdown_data))
+    bars = ax2.barh(y_pos, breakdown_data.values, color=[colors[i % len(colors)] for i in range(len(breakdown_data))])
     ax2.set_yticks(y_pos)
-    ax2.set_yticklabels(account_data.index)
+    ax2.set_yticklabels(breakdown_data.index)
     ax2.set_xlabel('Value ($)')
-    ax2.set_title('Value by Account', fontsize=12, fontweight='bold', pad=10)
+    ax2.set_title(title, fontsize=12, fontweight='bold', pad=10)
 
     # Add value labels on bars
-    for i, (bar, val) in enumerate(zip(bars, account_data.values)):
+    for i, (bar, val) in enumerate(zip(bars, breakdown_data.values)):
         ax2.text(val + metrics['total_value'] * 0.01, bar.get_y() + bar.get_height()/2,
                  f'${val:,.0f}', va='center', fontsize=9)
 
-    # Highlight largest account
-    largest_idx = list(account_data.index).index(metrics['largest_account'])
-    bars[largest_idx].set_color('#2E7D32')
-    bars[largest_idx].set_edgecolor('#1B5E20')
-    bars[largest_idx].set_linewidth(2)
+    # Highlight largest item
+    bars[0].set_color('#2E7D32')
+    bars[0].set_edgecolor('#1B5E20')
+    bars[0].set_linewidth(2)
 
     ax2.invert_yaxis()
 
@@ -229,7 +313,7 @@ def print_summary(metrics: dict):
 def main():
     """Main entry point."""
     # Default ODS file path
-    ods_file = "investment_portfolio.ods"
+    ods_file = "Portfolio.ods"
 
     # Allow command line argument for file path
     if len(sys.argv) > 1:
