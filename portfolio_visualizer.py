@@ -19,19 +19,41 @@ from pathlib import Path
 # Asset class mappings based on ticker/name patterns
 ASSET_CLASS_RULES = {
     'CASH$': 'Cash',
+    # Mining
     'MMA': 'Mining - Copper',
     'AMR': 'Mining - Coal',
     'CVE': 'Mining - Coal',
     'WM': 'Mining - Gold',
     'FAR': 'Mining - Services',
+    # Energy
     'TOU': 'Energy - Oil & Gas',
+    'PPL': 'Energy - Pipelines',
+    'ET': 'Energy - Pipelines',
+    # Real Estate
     'LAND': 'Real Estate',
+    # Consumer
     'LULU': 'Consumer Discretionary',
     'GURU': 'Consumer Staples',
     'PZZA': 'Consumer Discretionary',
+    'PZA': 'Consumer Discretionary',
+    'ABEV': 'Consumer Staples',
+    # Tech / Aerospace
     'RKLB': 'Aerospace & Defense',
+    # Healthcare / Biotech
     'CRSP': 'Biotech',
     'BEAM': 'Biotech',
+    # Transportation
+    'CNR': 'Transportation',
+    'CNI': 'Transportation',
+    # Financials
+    'BNS': 'Financials',
+    'TD': 'Financials',
+    'RY': 'Financials',
+    # Crypto
+    'BTC': 'Cryptocurrency',
+    'CARDANO': 'Cryptocurrency',
+    'ADA': 'Cryptocurrency',
+    'ETH': 'Cryptocurrency',
 }
 
 
@@ -59,45 +81,102 @@ def infer_asset_class(ticker: str, name: str) -> str:
     return 'Equities'
 
 
-def load_portfolio_data(ods_file: str) -> pd.DataFrame:
-    """Load investment data from an ODS file into a pandas DataFrame."""
-    data = pyexcel.get_array(file_name=ods_file)
+def parse_sheet_data(data: list, account_name: str) -> list:
+    """Parse data from a single sheet and return list of row dicts."""
+    rows = []
+    header = ['Name', 'Ticker', 'Price', 'Shares', 'Value', 'Percentage', 'Change', 'Extra1', 'Extra2']
 
-    if not data or len(data) < 2:
-        raise ValueError("ODS file is empty or has no data rows")
-
-    # Detect format: check if first row looks like headers or data
-    first_row = data[0]
-
-    # Check for Portfolio.ods format (data first, headers later)
-    # In this format, row 15 contains headers like 'Name', 'Ticker', etc.
-    is_portfolio_format = False
+    # Find header row if present (to know where data ends)
+    header_row_idx = len(data)
     for i, row in enumerate(data):
         if len(row) > 0 and row[0] == 'Name' and len(row) > 1 and row[1] == 'Ticker':
-            is_portfolio_format = True
-            header_row = i
+            header_row_idx = i
             break
 
-    if is_portfolio_format:
-        # Portfolio.ods format: data rows come before header row
-        header = ['Name', 'Ticker', 'Price', 'Shares', 'Value', 'Percentage', 'Change', 'Extra1', 'Extra2']
-        rows = []
-        for row in data[:header_row]:
-            # Skip empty rows or rows without valid data
-            if len(row) >= 5 and row[0] and row[4]:
-                try:
-                    value = float(row[4]) if row[4] else 0
-                    if value > 0:
-                        rows.append(row[:9] if len(row) >= 9 else row + [''] * (9 - len(row)))
-                except (ValueError, TypeError):
-                    continue
+    # Parse data rows (before header row if present)
+    for row in data[:header_row_idx]:
+        # Skip empty rows or rows without valid data
+        if len(row) < 5 or not row[0] or not row[1]:
+            continue
 
-        df = pd.DataFrame(rows, columns=header)
+        # Skip metadata rows (like "USD conv rate", totals, etc.)
+        ticker = str(row[1]).strip().upper()
+        name = str(row[0]).strip().lower()
+
+        # Skip internal references and totals
+        if ticker in ['', 'TFSA', 'RRSP', 'NAME', 'TICKER']:
+            continue
+        if name in ['tfsa', 'rrsp', 'total', '']:
+            continue
+
+        # Check if this is a crypto row with different format
+        # Crypto format: [Ticker, Price, Shares, Label, Value, ...]
+        col3_str = str(row[3]).strip().lower() if len(row) > 3 else ''
+        if 'total' in col3_str:
+            # This is crypto format: Name is ticker, col[1] is price, col[2] is shares, col[4] is value
+            try:
+                value = float(row[4]) if row[4] else 0
+                if value > 0:
+                    row_dict = {
+                        'Name': str(row[0]),
+                        'Ticker': str(row[0]).upper(),
+                        'Price': row[1],
+                        'Shares': row[2],
+                        'Value': value,
+                        'Percentage': '',
+                        'Change': '',
+                        'Extra1': '',
+                        'Extra2': '',
+                        'Account': account_name
+                    }
+                    rows.append(row_dict)
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        try:
+            value = float(row[4]) if row[4] else 0
+            if value > 0:
+                row_data = row[:9] if len(row) >= 9 else row + [''] * (9 - len(row))
+                row_dict = dict(zip(header, row_data))
+                row_dict['Account'] = account_name
+                rows.append(row_dict)
+        except (ValueError, TypeError):
+            continue
+
+    return rows
+
+
+def load_portfolio_data(ods_file: str) -> pd.DataFrame:
+    """Load investment data from an ODS file into a pandas DataFrame.
+
+    Supports multi-sheet ODS files where each sheet represents a different account.
+    """
+    # Get all sheet names
+    book = pyexcel.get_book(file_name=ods_file)
+    sheet_names = book.sheet_names()
+
+    all_rows = []
+
+    if len(sheet_names) > 1:
+        # Multi-sheet format: each sheet is an account
+        print(f"Found {len(sheet_names)} sheets: {', '.join(sheet_names)}")
+        for sheet_name in sheet_names:
+            data = pyexcel.get_array(file_name=ods_file, sheet_name=sheet_name)
+            if data:
+                rows = parse_sheet_data(data, sheet_name)
+                all_rows.extend(rows)
+                print(f"  - {sheet_name}: {len(rows)} holdings")
     else:
-        # Standard format: first row is header
-        header = data[0]
-        rows = data[1:]
-        df = pd.DataFrame(rows, columns=header)
+        # Single sheet format
+        data = pyexcel.get_array(file_name=ods_file)
+        if data:
+            all_rows = parse_sheet_data(data, 'Main Portfolio')
+
+    if not all_rows:
+        raise ValueError("ODS file is empty or has no valid data rows")
+
+    df = pd.DataFrame(all_rows)
 
     # Ensure numeric columns are proper types
     for col in ['Value', 'Shares', 'Price', 'Percentage', 'Change']:
@@ -107,10 +186,6 @@ def load_portfolio_data(ods_file: str) -> pd.DataFrame:
     # Add Asset Class column if not present
     if 'Asset Class' not in df.columns:
         df['Asset Class'] = df.apply(lambda row: infer_asset_class(row.get('Ticker', ''), row.get('Name', '')), axis=1)
-
-    # Add Account column if not present (default to 'Main Portfolio')
-    if 'Account' not in df.columns:
-        df['Account'] = 'Main Portfolio'
 
     return df
 
